@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package cluster;
+
+// ---------- Estruturas comuns ----------
+message LogEntry {
+  int64  term  = 1;
+  int64  index = 2;   // posicao sequencial (comeca em 1)
+  string key   = 3;
+  string value = 4;
+}
+
+// ---------- Replicacao (Pull) ----------
+// A replica informa seu ultimo termo/indice. Serve como busca de dados,
+// confirmacao de recebimento e heartbeat.
+message FetchRequest {
+  int32 replica_id     = 1;
+  int64 term           = 2;  // termo atual da replica
+  int64 last_log_term  = 3;
+  int64 last_log_index = 4;
+}
+
+message FetchResponse {
+  int64 term                = 1;  // termo do lider (toda resposta carrega termo)
+  bool  success             = 2;
+  int32 leader_id           = 3;
+  repeated LogEntry entries = 4;
+  int64 commit_index        = 5;
+  bool  diverged            = 6;  // true => replica deve truncar
+  int64 diverge_index       = 7;  // truncar entradas com index >= diverge_index
+  string error_message      = 8;
+}
+
+// ---------- Eleicao ----------
+message VoteRequest {
+  int32 candidate_id   = 1;
+  int64 term           = 2;
+  int64 last_log_term  = 3;
+  int64 last_log_index = 4;
+}
+
+message VoteResponse {
+  int64 term         = 1;
+  bool  vote_granted = 2;
+}
+
+// ---------- Status (observabilidade) ----------
+message StatusRequest {}
+
+message StatusResponse {
+  int32  node_id        = 1;
+  string role           = 2;  // follower | candidate | leader
+  int64  term           = 3;
+  int64  commit_index   = 4;
+  int64  last_log_index = 5;
+  int32  leader_id      = 6;  // 0 = desconhecido
+}
+
+// ---------- Cliente ----------
+message WriteRequest {
+  string key   = 1;
+  string value = 2;
+}
+
+message WriteResponse {
+  bool   success        = 1;
+  int32  leader_id      = 2;  // preenchido quando o no nao e lider
+  string leader_address = 3;
+  string error_message  = 4;
+  int64  term           = 5;
+  int64  index          = 6;
+}
+
+message ReadRequest {
+  string key = 1;
+}
+
+message ReadResponse {
+  bool   found        = 1;
+  string value        = 2;
+  int32  node_id      = 3;
+  string role         = 4;
+  int64  term         = 5;
+  int64  commit_index = 6;
+}
+
+// ---------- Servicos ----------
+service ClusterService {
+  rpc Fetch(FetchRequest)       returns (FetchResponse);
+  rpc RequestVote(VoteRequest)  returns (VoteResponse);
+  rpc GetStatus(StatusRequest)  returns (StatusResponse);
+}
+
+service ClientService {
+  rpc Write(WriteRequest) returns (WriteResponse);
+  rpc Read(ReadRequest)   returns (ReadResponse);
+}
