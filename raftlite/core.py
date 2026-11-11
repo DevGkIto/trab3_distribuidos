@@ -199,3 +199,18 @@ def truncate_safely(log: Log, from_index: int, commit_index: int) -> List[LogEnt
             f"tentativa de truncar entrada comitada (from={from_index}, commit={commit_index})"
         )
     return log.truncate_from(from_index)
+
+# ---------------------------------------------------------------- vivacidade (Fase 3)
+def active_replicas(last_fetch_time: Dict[int, float], now: float,
+                    heartbeat_timeout: float) -> List[int]:
+    """Replicas cujo ultimo Fetch foi ha no maximo `heartbeat_timeout` segundos.
+
+    `last_fetch_time`: {id_da_replica: instante do ultimo FetchRequest}.
+    O limite exato conta como ATIVA (<=). Replica que nunca buscou nao aparece.
+    """
+    return sorted(r for r, t in last_fetch_time.items() if now - t <= heartbeat_timeout)
+
+
+def has_quorum(n_active_replicas: int, quorum: int) -> bool:
+    """O lider conta a si mesmo: 1 + replicas ativas >= quorum."""
+    return 1 + n_active_replicas >= quorum
