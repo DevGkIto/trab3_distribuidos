@@ -6,6 +6,7 @@
 """
 import argparse
 import sys
+import time
 
 import grpc
 
@@ -13,33 +14,56 @@ from raftlite import config
 from raftlite.pb import pb, pbg
 
 
-def write_with_redirect(key, value, start_node=1, base_port=config.DEFAULT_BASE_PORT,
-                        max_redirects=3, timeout=config.WRITE_TIMEOUT + 2):
-    """Retorna (resposta|None, trilha). Segue redirecionamentos e pula nos fora do ar."""
+def _try_once(key, value, start_node, base_port, max_redirects, timeout):
+    """Uma rodada: segue redirecionamentos e pula nos fora do ar.
+    Retorna (resposta|None, trilha, vale_tentar_de_novo)."""
     trail, tried, redirects, node = [], set(), 0, start_node
     while True:
+        tried.add(node)
         try:
-            with grpc.insecure_channel(config.address(node, base_port), options=config.CHANNEL_OPTIONS) as ch:
+            with grpc.insecure_channel(config.address(node, base_port),
+                                       options=config.CHANNEL_OPTIONS) as ch:
                 resp = pbg.ClientServiceStub(ch).Write(
                     pb.WriteRequest(key=key, value=value), timeout=timeout)
         except grpc.RpcError:
             trail.append(f"no {node} indisponivel")
-            tried.add(node)
             rest = [n for n in range(1, config.N_NODES + 1) if n not in tried]
             if not rest:
-                return None, trail
+                return None, trail, True
             node = rest[0]
             continue
         if resp.success:
             trail.append(f"no {node}: OK (indice {resp.index}, termo {resp.term})")
-            return resp, trail
-        if resp.leader_id and resp.leader_id != node and redirects < max_redirects:
-            trail.append(f"no {node} nao e lider -> redirecionando para o no {resp.leader_id}")
-            redirects += 1
-            node = resp.leader_id
-            continue
-        trail.append(f"no {node}: {resp.error_message}")
-        return resp, trail
+            return resp, trail, False
+        if resp.error_message == config.NOT_LEADER:
+            if resp.leader_id and resp.leader_id not in tried and redirects < max_redirects:
+                trail.append(f"no {node} nao e lider -> redirecionando para o no {resp.leader_id}")
+                redirects += 1
+                node = resp.leader_id
+                continue
+            rest = [n for n in range(1, config.N_NODES + 1) if n not in tried]
+            if rest:
+                trail.append(f"no {node} nao e lider e nao sabe quem e")
+                node = rest[0]
+                continue
+            return resp, trail, True            # ninguem sabe o lider (eleicao em curso?)
+        trail.append(f"no {node}: {resp.error_message}")   # recusa definitiva (quorum, timeout)
+        return resp, trail, False
+
+
+def write_with_redirect(key, value, start_node=1, base_port=config.DEFAULT_BASE_PORT,
+                        max_redirects=3, timeout=config.WRITE_TIMEOUT + 2, retry_for=0.0):
+    """Retorna (resposta|None, trilha). Se nao houver lider/no acessivel, repete por
+    `retry_for` segundos (util durante uma eleicao). Recusas definitivas nao repetem."""
+    end = time.monotonic() + retry_for
+    trail_all = []
+    while True:
+        resp, trail, retry = _try_once(key, value, start_node, base_port, max_redirects, timeout)
+        trail_all += trail
+        if not retry or time.monotonic() >= end:
+            return resp, trail_all
+        trail_all.append("sem lider no momento; tentando novamente...")
+        time.sleep(0.3)
 
 
 def read_node(node_id, key, base_port=config.DEFAULT_BASE_PORT, timeout=1.0):
@@ -64,13 +88,16 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
     w = sub.add_parser("write"); w.add_argument("key"); w.add_argument("value")
     w.add_argument("--node", type=int, default=1)
+    w.add_argument("--retry-for", type=float, default=5.0,
+                   help="segundos tentando de novo se nao houver lider (padrao 5)")
     r = sub.add_parser("read"); r.add_argument("key"); r.add_argument("--node", type=int, required=True)
     ra = sub.add_parser("read-all"); ra.add_argument("key")
     sub.add_parser("status")
     a = p.parse_args()
 
     if a.cmd == "write":
-        resp, trail = write_with_redirect(a.key, a.value, a.node, a.base_port)
+        resp, trail = write_with_redirect(a.key, a.value, a.node, a.base_port,
+                                          retry_for=a.retry_for)
         print("\n".join(trail))
         sys.exit(0 if resp is not None and resp.success else 1)
     elif a.cmd == "read":

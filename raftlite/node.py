@@ -1,17 +1,18 @@
-"""No do cluster. Fase 2: lider fixo (--role leader), sem eleicao."""
+"""No do cluster: Seguidor / Candidato / Lider (Fases 2 a 4)."""
 from __future__ import annotations
 
+import random
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
 import grpc
 
 from . import config
 from .core import (Log, LogEntry, LogError, NodeState, Role, active_replicas,
-                   apply_committed, compute_commit_index, has_quorum,
-                   find_divergence, follower_commit_index,
+                   apply_committed, compute_commit_index, decide_vote,
+                   find_divergence, follower_commit_index, has_quorum,
                    quorum_size, step_down_if_newer, truncate_safely)
 from .pb import pb, pbg
 from .storage import Storage
@@ -24,13 +25,20 @@ def _to_pb(e: LogEntry):
 class Node:
     def __init__(self, node_id: int, role: str, data_dir, base_port: int = config.DEFAULT_BASE_PORT,
                  leader_id: int = 1, write_timeout: float = config.WRITE_TIMEOUT,
-                 status_interval: float = 1.0, heartbeat_timeout: float = config.HEARTBEAT_TIMEOUT):
+                 status_interval: float = 1.0,
+                 heartbeat_timeout: float = config.HEARTBEAT_TIMEOUT,
+                 election_min: float = config.ELECTION_TIMEOUT_MIN,
+                 election_max: float = config.ELECTION_TIMEOUT_MAX):
         self.id = node_id
         self.base_port = base_port
         self.write_timeout = write_timeout
         self.status_interval = status_interval
         self.heartbeat_timeout = heartbeat_timeout
-        self._active_prev = set()
+        self.election_min = election_min
+        self.election_max = election_max
+        self._rng = random.Random()
+        self._rr = 0                        # rodizio de pares quando o lider e desconhecido
+        self._active_prev = set()           # para detectar mudancas ativa/inativa
 
         # --- estado persistido (recarregado apos reinicio) ---
         self.storage = Storage(data_dir)
@@ -51,29 +59,62 @@ class Node:
         self._stop = threading.Event()
         self._stubs: Dict[int, object] = {}
         self._leader_down = False
+        self._election_deadline = 0.0
+        self._reset_election_timer()
 
-        if role == "leader":
+        if role == "leader":                 # bootstrap opcional (modo lider fixo)
             if self.state.current_term < 1:
                 self.state.current_term = 1
-                self.storage.save_meta(1, self.state.voted_for)
+                self.state.voted_for = node_id
+                self.storage.save_meta(1, node_id)
             self.state.role = Role.LEADER
             self.state.leader_id = node_id
         else:
             self.state.role = Role.FOLLOWER
-            self.state.leader_id = leader_id
+            self.state.leader_id = leader_id if leader_id and leader_id != node_id else None
 
     # ------------------------------------------------------------ util
+    @property
+    def peers(self):
+        return [n for n in range(1, config.N_NODES + 1) if n != self.id]
+
     def event(self, msg: str) -> None:
         print(f"[{time.strftime('%H:%M:%S')}][No {self.id}] {msg}", flush=True)
 
     def start(self) -> None:
-        threading.Thread(target=self._fetch_loop, daemon=True).start()
-        threading.Thread(target=self._monitor_loop, daemon=True).start()
+        loops = [self._fetch_loop, self._monitor_loop, self._election_loop, self._probe_loop]
         if self.status_interval > 0:
-            threading.Thread(target=self._status_loop, daemon=True).start()
+            loops.append(self._status_loop)
+        for fn in loops:
+            threading.Thread(target=fn, daemon=True).start()
 
     def stop(self) -> None:
         self._stop.set()
+
+    def _reset_election_timer(self) -> None:
+        """Novo prazo ALEATORIO: evita que todos virem candidatos juntos (split vote)."""
+        self._election_deadline = time.monotonic() + self._rng.uniform(
+            self.election_min, self.election_max)
+
+    def _stub(self, node_id: int):
+        if node_id not in self._stubs:
+            ch = grpc.insecure_channel(config.address(node_id, self.base_port),
+                                       options=config.CHANNEL_OPTIONS)
+            self._stubs[node_id] = pbg.ClusterServiceStub(ch)
+        return self._stubs[node_id]
+
+    def _observe_term(self, term: int) -> bool:
+        """Atualizacao obrigatoria de termo (qualquer mensagem/resposta). Lock travado."""
+        st = self.state
+        old_term, old_role = st.current_term, st.role
+        if step_down_if_newer(st, term, self.storage):
+            self.event(f"termo maior observado ({old_term} -> {term}): "
+                       f"{old_role.value} -> SEGUIDOR")
+            if old_role == Role.LEADER:
+                self._reset_election_timer()
+            self.cond.notify_all()            # acorda Writes pendentes (lideranca perdida)
+            return True
+        return False
 
     def _status_loop(self) -> None:
         while not self._stop.wait(self.status_interval):
@@ -110,6 +151,101 @@ class Node:
                                f"({'OK' if ok else 'PERDIDO'})")
                 self._active_prev = now
 
+    def _probe_loop(self) -> None:
+        """Lider sonda pares inativos: se algum responder com termo maior, vira seguidor.
+        (Cobre o lider antigo que volta de uma pausa/particao sem ninguem buscar nele.)"""
+        while not self._stop.wait(config.PROBE_INTERVAL):
+            with self.cond:
+                if self.state.role != Role.LEADER:
+                    continue
+                active = set(self._active_replicas_locked())
+                targets = [p for p in self.peers if p not in active]
+            for p in targets:
+                try:
+                    resp = self._stub(p).GetStatus(pb.StatusRequest(),
+                                                   timeout=config.PROBE_RPC_TIMEOUT)
+                except grpc.RpcError:
+                    continue
+                with self.cond:
+                    self._observe_term(resp.term)
+
+    # ------------------------------------------------------------ eleicao (Fase 4)
+    def _election_loop(self) -> None:
+        while not self._stop.wait(0.05):
+            with self.cond:
+                if self.state.role != Role.LEADER and time.monotonic() >= self._election_deadline:
+                    self._start_election_locked()
+
+    def _start_election_locked(self) -> None:
+        st = self.state
+        st.current_term += 1
+        st.voted_for = self.id
+        st.role = Role.CANDIDATE
+        st.leader_id = None
+        self.storage.save_meta(st.current_term, st.voted_for)   # persiste ANTES de pedir votos
+        self._reset_election_timer()
+        term = st.current_term
+        self.event(f"sem contato com o lider: virou CANDIDATO (termo {term})")
+        req = pb.VoteRequest(candidate_id=self.id, term=term,
+                             last_log_term=self.log.last_term(),
+                             last_log_index=self.log.last_index())
+        threading.Thread(target=self._run_election, args=(term, req), daemon=True).start()
+
+    def _run_election(self, term: int, req) -> None:
+        votes = {self.id}                     # vota em si mesmo
+        need = quorum_size(config.N_NODES)
+
+        def ask(peer: int) -> None:
+            try:   # RPC fora do lock, em paralelo
+                resp = self._stub(peer).RequestVote(req, timeout=config.VOTE_RPC_TIMEOUT)
+            except grpc.RpcError:
+                return
+            with self.cond:
+                st = self.state
+                if self._observe_term(resp.term):
+                    return                    # alguem tem termo maior: desisto
+                if st.role != Role.CANDIDATE or st.current_term != term:
+                    return                    # a eleicao ja foi decidida/expirou: descarta
+                if resp.vote_granted:
+                    votes.add(peer)
+                    self.event(f"voto recebido do no {peer} ({len(votes)}/{need})")
+                    if len(votes) >= need:
+                        self._become_leader_locked()
+
+        for p in self.peers:
+            threading.Thread(target=ask, args=(p,), daemon=True).start()
+
+    def _become_leader_locked(self) -> None:
+        st = self.state
+        st.role = Role.LEADER
+        st.leader_id = self.id
+        self.match_index.clear()
+        self.last_fetch_time.clear()
+        self._active_prev = set()
+        self.event(f"*** ELEITO LIDER no termo {st.current_term} ***")
+        self.cond.notify_all()
+
+    def handle_request_vote(self, req):
+        with self.cond:
+            st = self.state
+            old_term, old_role = st.current_term, st.role
+            granted = decide_vote(st, self.log, req.candidate_id, req.term,
+                                  req.last_log_term, req.last_log_index, self.storage)
+            if st.current_term != old_term:
+                self.event(f"termo maior observado ({old_term} -> {st.current_term}) "
+                           f"via RequestVote do no {req.candidate_id}")
+            if old_role == Role.LEADER and st.role != Role.LEADER:
+                self.event("lider antigo: virando SEGUIDOR")
+                self._reset_election_timer()
+                self.cond.notify_all()
+            if granted:
+                self._reset_election_timer()
+                self.event(f"voto CONCEDIDO ao no {req.candidate_id} (termo {req.term})")
+            else:
+                self.event(f"voto NEGADO ao no {req.candidate_id} (termo {req.term}; "
+                           f"meu termo {st.current_term}, voted_for={st.voted_for})")
+            return pb.VoteResponse(term=st.current_term, vote_granted=granted)
+
     # ------------------------------------------------------------ commit
     def _apply_locked(self) -> None:
         applied = apply_committed(self.state, self.log, self.db)
@@ -134,13 +270,13 @@ class Node:
     def handle_fetch(self, req):
         with self.cond:
             st = self.state
-            step_down_if_newer(st, req.term, self.storage)
+            self._observe_term(req.term)
             if st.role != Role.LEADER:
                 return pb.FetchResponse(term=st.current_term, success=False,
                                         leader_id=st.leader_id or 0,
-                                        error_message="este no nao e o lider")
+                                        error_message=config.NOT_LEADER)
             rid = req.replica_id
-            self.last_fetch_time[rid] = time.monotonic()      # heartbeat (usado na Fase 3)
+            self.last_fetch_time[rid] = time.monotonic()      # heartbeat
 
             div = find_divergence(self.log, req.last_log_index, req.last_log_term)
             if div is not None:
@@ -162,7 +298,7 @@ class Node:
                 lid = st.leader_id or 0
                 return pb.WriteResponse(success=False, leader_id=lid,
                                         leader_address=config.address(lid, self.base_port) if lid else "",
-                                        error_message="este no nao e o lider", term=st.current_term)
+                                        error_message=config.NOT_LEADER, term=st.current_term)
             # Sem quorum, sem escrita: recusa ANTES de gravar no log.
             active = self._active_replicas_locked()
             if not has_quorum(len(active), quorum_size(config.N_NODES)):
@@ -211,13 +347,6 @@ class Node:
                                      leader_id=s.leader_id or 0)
 
     # ------------------------------------------------------------ lado da REPLICA
-    def _stub(self, leader_id: int):
-        if leader_id not in self._stubs:
-            ch = grpc.insecure_channel(config.address(leader_id, self.base_port),
-                                       options=config.CHANNEL_OPTIONS)
-            self._stubs[leader_id] = pbg.ClusterServiceStub(ch)
-        return self._stubs[leader_id]
-
     def _fetch_loop(self) -> None:
         while not self._stop.is_set():
             t0 = time.monotonic()
@@ -230,34 +359,50 @@ class Node:
     def _fetch_once(self) -> None:
         with self.cond:
             st = self.state
-            if st.role == Role.LEADER or not st.leader_id:
+            if st.role == Role.LEADER:
                 return
-            leader_id = st.leader_id
+            target = st.leader_id
+            known = bool(target)
+            if not known:                    # lider desconhecido: procura rodando pelos pares
+                peers = self.peers
+                target = peers[self._rr % len(peers)]
+                self._rr += 1
             req = pb.FetchRequest(replica_id=self.id, term=st.current_term,
                                   last_log_term=self.log.last_term(),
                                   last_log_index=self.log.last_index())
         try:   # RPC fora do lock
-            resp = self._stub(leader_id).Fetch(req, timeout=config.FETCH_RPC_TIMEOUT)
+            resp = self._stub(target).Fetch(req, timeout=config.FETCH_RPC_TIMEOUT)
         except grpc.RpcError:
-            if not self._leader_down:
-                self.event(f"lider (no {leader_id}) inacessivel")
-                self._leader_down = True
+            with self.cond:
+                if known and self.state.leader_id == target:
+                    self.state.leader_id = None      # lider morreu: passa a procurar outro
+                    if not self._leader_down:
+                        self.event(f"lider (no {target}) inacessivel")
+                        self._leader_down = True
             return
-        if self._leader_down:
-            self.event(f"lider (no {leader_id}) voltou a responder")
-            self._leader_down = False
+        self._leader_down = False
         with self.cond:
             self._handle_fetch_response(resp)
 
     def _handle_fetch_response(self, resp) -> None:
         st = self.state
         if st.role == Role.LEADER or resp.term < st.current_term:
+            return                                   # resposta de lider velho: ignora
+        self._observe_term(resp.term)
+        if not resp.success and not resp.diverged:   # no que nao e lider: segue a dica
+            hint = resp.leader_id
+            st.leader_id = hint if hint and hint != self.id else None
             return
-        step_down_if_newer(st, resp.term, self.storage)
-        if resp.leader_id:
-            st.leader_id = resp.leader_id
-        if not resp.success and not resp.diverged:
-            return
+
+        # --- resposta de um LIDER valido (termo >= o meu) ---
+        if st.role == Role.CANDIDATE:
+            self.event(f"lider {resp.leader_id} encontrado no termo {resp.term}: "
+                       f"CANDIDATO -> SEGUIDOR")
+        elif st.leader_id != resp.leader_id:
+            self.event(f"seguindo o lider {resp.leader_id} (termo {resp.term})")
+        st.role = Role.FOLLOWER
+        st.leader_id = resp.leader_id
+        self._reset_election_timer()                 # Fetch bem-sucedido reinicia o timer
 
         if resp.diverged:
             try:

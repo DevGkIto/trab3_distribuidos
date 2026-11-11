@@ -214,3 +214,25 @@ def active_replicas(last_fetch_time: Dict[int, float], now: float,
 def has_quorum(n_active_replicas: int, quorum: int) -> bool:
     """O lider conta a si mesmo: 1 + replicas ativas >= quorum."""
     return 1 + n_active_replicas >= quorum
+
+
+# ---------------------------------------------------------------- eleicao (Fase 4)
+def decide_vote(state: NodeState, log: Log, cand_id: int, cand_term: int,
+                cand_last_term: int, cand_last_index: int, storage=None) -> bool:
+    """Handler puro do RequestVote. Retorna True se o voto foi concedido.
+
+    1) termo menor -> nega (nada muda); 2) termo maior -> atualiza termo/vira seguidor;
+    3) voto unico por termo; 4) log do candidato precisa estar tao ou mais atualizado.
+    O voto e persistido ANTES de retornar (senao o voto unico se perde num crash).
+    """
+    if cand_term < state.current_term:
+        return False
+    step_down_if_newer(state, cand_term, storage)
+    if state.voted_for not in (None, cand_id):
+        return False
+    if not is_log_up_to_date(cand_last_term, cand_last_index, log.last_term(), log.last_index()):
+        return False
+    state.voted_for = cand_id
+    if storage is not None:
+        storage.save_meta(state.current_term, state.voted_for)
+    return True
