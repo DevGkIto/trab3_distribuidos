@@ -81,6 +81,17 @@ def status_node(node_id, base_port=config.DEFAULT_BASE_PORT, timeout=1.0):
     except grpc.RpcError:
         return None
 
+def write_once(node_id, key, value, base_port=config.DEFAULT_BASE_PORT, timeout=3.0):
+    """UMA tentativa em UM no, sem redirecionar nem tentar outros (debug do Cenario 4B).
+    Retorna (resposta|None, codigo_de_erro|None)."""
+    try:
+        with grpc.insecure_channel(config.address(node_id, base_port),
+                                   options=config.CHANNEL_OPTIONS) as ch:
+            return pbg.ClientServiceStub(ch).Write(
+                pb.WriteRequest(key=key, value=value), timeout=timeout), None
+    except grpc.RpcError as e:
+        return None, e.code().name
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -90,12 +101,22 @@ def main():
     w.add_argument("--node", type=int, default=1)
     w.add_argument("--retry-for", type=float, default=5.0,
                    help="segundos tentando de novo se nao houver lider (padrao 5)")
+    w.add_argument("--once", action="store_true",
+                   help="uma unica tentativa no --node, sem redirecionar (Cenario 4B)")
+    w.add_argument("--timeout", type=float, default=3.0, help="timeout do --once (s)")
     r = sub.add_parser("read"); r.add_argument("key"); r.add_argument("--node", type=int, required=True)
     ra = sub.add_parser("read-all"); ra.add_argument("key")
     sub.add_parser("status")
     a = p.parse_args()
 
-    if a.cmd == "write":
+    if a.cmd == "write" and a.once:
+        resp, err = write_once(a.node, a.key, a.value, a.base_port, a.timeout)
+        if resp is None:
+            print(f"no {a.node}: sem resposta ({err}) - a escrita PODE ter sido gravada no log do no")
+        else:
+            print(f"no {a.node}: {'OK' if resp.success else resp.error_message}")
+        sys.exit(0 if resp is not None and resp.success else 1)
+    elif a.cmd == "write":
         resp, trail = write_with_redirect(a.key, a.value, a.node, a.base_port,
                                           retry_for=a.retry_for)
         print("\n".join(trail))

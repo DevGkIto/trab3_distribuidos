@@ -53,6 +53,7 @@ class Node:
         self.match_index: Dict[int, int] = {}
         self.last_fetch_time: Dict[int, float] = {}
         self.hold_file = Path(data_dir) / "HOLD_COMMIT"   # debug: Cenario 5
+        self.pause_file = Path(data_dir) / "PAUSE_REPLICATION"
 
         # Um unico mutex protege todo o estado. NUNCA chamar RPC com ele travado.
         self.cond = threading.Condition()
@@ -286,7 +287,8 @@ class Node:
 
             self.match_index[rid] = req.last_log_index         # confirmacao de recebimento
             self._advance_commit_locked()
-            entries = self.log.entries_from(req.last_log_index + 1, config.FETCH_BATCH)
+            entries = [] if self.pause_file.exists() else \
+                self.log.entries_from(req.last_log_index + 1, config.FETCH_BATCH)
             return pb.FetchResponse(term=st.current_term, success=True, leader_id=self.id,
                                     commit_index=st.commit_index,
                                     entries=[_to_pb(e) for e in entries])
